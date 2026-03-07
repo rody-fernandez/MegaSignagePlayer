@@ -9,6 +9,9 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.VideoView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -44,11 +47,21 @@ class MainActivity : AppCompatActivity() {
     private var heartbeatTimer: Timer? = null
     private var configTimer: Timer? = null
 
+    // Control para no redescargar / no reiniciar el mismo video
+    private var currentItemUrl: String = ""
+    private var currentLocalPath: String = ""
+    private var isPlayingVideo = false
+    private var isDownloading = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+
         setContentView(R.layout.activity_main)
+
+        hideSystemUi()
 
         videoView = findViewById(R.id.videoView)
         infoPanel = findViewById(R.id.infoPanel)
@@ -56,6 +69,11 @@ class MainActivity : AppCompatActivity() {
         txtCode = findViewById(R.id.txtCode)
         txtScreen = findViewById(R.id.txtScreen)
         txtDetail = findViewById(R.id.txtDetail)
+
+        txtStatus.text = "Estado: iniciando..."
+        txtCode.text = "------"
+        txtScreen.visibility = View.GONE
+        txtDetail.text = ""
 
         val prefs = getSharedPreferences("mega_signage_player", Context.MODE_PRIVATE)
         token = prefs.getString("token", "") ?: ""
@@ -72,15 +90,56 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        hideSystemUi()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemUi()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         heartbeatTimer?.cancel()
         configTimer?.cancel()
     }
 
+    private fun hideSystemUi() {
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.hide(WindowInsetsCompat.Type.statusBars() or WindowInsetsCompat.Type.navigationBars())
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
+
+    private fun startHeartbeat() {
+        heartbeatTimer?.cancel()
+        heartbeatTimer = Timer()
+
+        heartbeatTimer?.scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                sendHeartbeat()
+            }
+        }, 0, 5000)
+    }
+
+    private fun startConfigPolling() {
+        configTimer?.cancel()
+        configTimer = Timer()
+
+        configTimer?.scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                fetchConfig()
+            }
+        }, 0, 8000)
+    }
+
     private fun registerPlayer() {
-        txtStatus.text = "Estado: registrando..."
-        txtDetail.text = ""
+        runOnUiThread {
+            txtStatus.text = "Estado: registrando..."
+            txtDetail.text = ""
+        }
 
         Thread {
             try {
@@ -139,17 +198,6 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun startHeartbeat() {
-        heartbeatTimer?.cancel()
-        heartbeatTimer = Timer()
-
-        heartbeatTimer?.scheduleAtFixedRate(object : TimerTask() {
-            override fun run() {
-                sendHeartbeat()
-            }
-        }, 0, 5000)
-    }
-
     private fun sendHeartbeat() {
         if (token.isBlank()) return
 
@@ -166,31 +214,26 @@ class MainActivity : AppCompatActivity() {
                 client.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) {
                         runOnUiThread {
-                            txtDetail.text = "Heartbeat HTTP ${response.code}"
+                            if (!isPlayingVideo) {
+                                txtDetail.text = "Heartbeat HTTP ${response.code}"
+                            }
                         }
                     }
                 }
             } catch (_: IOException) {
                 runOnUiThread {
-                    txtDetail.text = "Heartbeat sin conexión"
+                    if (!isPlayingVideo) {
+                        txtDetail.text = "Heartbeat sin conexión"
+                    }
                 }
             } catch (e: Exception) {
                 runOnUiThread {
-                    txtDetail.text = e.toString()
+                    if (!isPlayingVideo) {
+                        txtDetail.text = e.toString()
+                    }
                 }
             }
         }.start()
-    }
-
-    private fun startConfigPolling() {
-        configTimer?.cancel()
-        configTimer = Timer()
-
-        configTimer?.scheduleAtFixedRate(object : TimerTask() {
-            override fun run() {
-                fetchConfig()
-            }
-        }, 0, 6000)
     }
 
     private fun fetchConfig() {
@@ -208,8 +251,10 @@ class MainActivity : AppCompatActivity() {
 
                     if (!response.isSuccessful) {
                         runOnUiThread {
-                            txtStatus.text = "Estado: error config"
-                            txtDetail.text = "HTTP ${response.code}: $body"
+                            if (!isPlayingVideo) {
+                                txtStatus.text = "Estado: error config"
+                                txtDetail.text = "HTTP ${response.code}: $body"
+                            }
                         }
                         return@use
                     }
@@ -219,6 +264,7 @@ class MainActivity : AppCompatActivity() {
 
                     if (!paired) {
                         runOnUiThread {
+                            isPlayingVideo = false
                             infoPanel.visibility = View.VISIBLE
                             videoView.visibility = View.GONE
                             txtStatus.text = "Estado: esperando vinculación"
@@ -239,34 +285,60 @@ class MainActivity : AppCompatActivity() {
                         txtScreen.visibility = View.VISIBLE
                     }
 
-                    if (items.length() > 0) {
-                        val firstItem = items.getJSONObject(0)
-                        val relativeUrl = firstItem.optString("url", "")
-                        if (relativeUrl.isNotBlank()) {
-                            val fullUrl = if (relativeUrl.startsWith("http")) {
-                                relativeUrl
-                            } else {
-                                "$server$relativeUrl"
-                            }
+                    if (items.length() <= 0) return@use
 
-                            val localFile = downloadFile(fullUrl)
-                            playLocalFile(localFile)
-                        }
+                    val firstItem = items.getJSONObject(0)
+                    val relativeUrl = firstItem.optString("url", "")
+                    if (relativeUrl.isBlank()) return@use
+
+                    val fullUrl = if (relativeUrl.startsWith("http")) {
+                        relativeUrl
+                    } else {
+                        "$server$relativeUrl"
+                    }
+
+                    // Si ya está reproduciendo este mismo item, no hacer nada
+                    if (currentItemUrl == fullUrl && currentLocalPath.isNotBlank() && File(currentLocalPath).exists()) {
+                        return@use
+                    }
+
+                    if (isDownloading) return@use
+                    isDownloading = true
+
+                    try {
+                        val localFile = downloadFile(fullUrl)
+                        currentItemUrl = fullUrl
+                        currentLocalPath = localFile.absolutePath
+                        playLocalFile(localFile)
+                    } finally {
+                        isDownloading = false
                     }
                 }
             } catch (_: IOException) {
                 runOnUiThread {
-                    txtDetail.text = "Config sin conexión"
+                    if (!isPlayingVideo) {
+                        txtDetail.text = "Config sin conexión"
+                    }
                 }
             } catch (e: Exception) {
                 runOnUiThread {
-                    txtDetail.text = e.toString()
+                    if (!isPlayingVideo) {
+                        txtDetail.text = e.toString()
+                    }
                 }
             }
         }.start()
     }
 
     private fun downloadFile(url: String): File {
+        val fileName = Uri.parse(url).lastPathSegment ?: "media.bin"
+        val file = File(filesDir, fileName)
+
+        // Si ya existe, reutilizar
+        if (file.exists() && file.length() > 0) {
+            return file
+        }
+
         val request = Request.Builder().url(url).build()
 
         client.newCall(request).execute().use { response ->
@@ -275,24 +347,29 @@ class MainActivity : AppCompatActivity() {
             }
 
             val body = response.body ?: throw Exception("Body vacío")
-            val dir = filesDir
-            val fileName = Uri.parse(url).lastPathSegment ?: "media.bin"
-            val file = File(dir, fileName)
 
             body.byteStream().use { input ->
                 FileOutputStream(file).use { output ->
                     input.copyTo(output)
                 }
             }
-
-            return file
         }
+
+        return file
     }
 
     private fun playLocalFile(file: File) {
         runOnUiThread {
+            hideSystemUi()
+
             infoPanel.visibility = View.GONE
             videoView.visibility = View.VISIBLE
+            isPlayingVideo = true
+
+            // evita reabrir si ya está con ese mismo archivo
+            if (videoView.isPlaying && currentLocalPath == file.absolutePath) {
+                return@runOnUiThread
+            }
 
             videoView.setVideoPath(file.absolutePath)
 
@@ -300,12 +377,14 @@ class MainActivity : AppCompatActivity() {
                 mp.isLooping = true
                 mp.seekTo(0)
                 videoView.start()
+                hideSystemUi()
             }
 
             videoView.setOnErrorListener { _, what, extra ->
-                txtDetail.text = "Video error what=$what extra=$extra"
+                isPlayingVideo = false
                 infoPanel.visibility = View.VISIBLE
                 videoView.visibility = View.GONE
+                txtDetail.text = "Video error what=$what extra=$extra"
                 true
             }
         }
