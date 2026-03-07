@@ -1,10 +1,12 @@
 package com.example.megasignageplayer
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import android.view.WindowManager
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.VideoView
@@ -27,6 +29,7 @@ import java.util.TimerTask
 class MainActivity : AppCompatActivity() {
 
     private lateinit var videoView: VideoView
+    private lateinit var imageView: ImageView
     private lateinit var infoPanel: LinearLayout
     private lateinit var txtStatus: TextView
     private lateinit var txtCode: TextView
@@ -37,7 +40,6 @@ class MainActivity : AppCompatActivity() {
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
     private val server = "http://192.168.134.1:3000"
-
     private val playerName = "ANDROID-BOX"
 
     private var token: String = ""
@@ -46,12 +48,22 @@ class MainActivity : AppCompatActivity() {
 
     private var heartbeatTimer: Timer? = null
     private var configTimer: Timer? = null
+    private var imageTimer: Timer? = null
 
-    // Control para no redescargar / no reiniciar el mismo video
-    private var currentItemUrl: String = ""
-    private var currentLocalPath: String = ""
-    private var isPlayingVideo = false
+    private var playlistSignature: String = ""
+    private var playlistItems: MutableList<PlaylistItem> = mutableListOf()
+    private var currentIndex: Int = 0
+
+    private var isPlayingMedia = false
     private var isDownloading = false
+    private var currentPlayingPath: String = ""
+
+    data class PlaylistItem(
+        val id: Int,
+        val name: String,
+        val url: String,
+        val localPath: String
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,10 +72,10 @@ class MainActivity : AppCompatActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
         setContentView(R.layout.activity_main)
-
         hideSystemUi()
 
         videoView = findViewById(R.id.videoView)
+        imageView = findViewById(R.id.imageView)
         infoPanel = findViewById(R.id.infoPanel)
         txtStatus = findViewById(R.id.txtStatus)
         txtCode = findViewById(R.id.txtCode)
@@ -104,6 +116,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         heartbeatTimer?.cancel()
         configTimer?.cancel()
+        imageTimer?.cancel()
     }
 
     private fun hideSystemUi() {
@@ -132,7 +145,7 @@ class MainActivity : AppCompatActivity() {
             override fun run() {
                 fetchConfig()
             }
-        }, 0, 8000)
+        }, 0, 6000)
     }
 
     private fun registerPlayer() {
@@ -212,23 +225,21 @@ class MainActivity : AppCompatActivity() {
                     .build()
 
                 client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
+                    if (!response.isSuccessful && !isPlayingMedia) {
                         runOnUiThread {
-                            if (!isPlayingVideo) {
-                                txtDetail.text = "Heartbeat HTTP ${response.code}"
-                            }
+                            txtDetail.text = "Heartbeat HTTP ${response.code}"
                         }
                     }
                 }
             } catch (_: IOException) {
-                runOnUiThread {
-                    if (!isPlayingVideo) {
+                if (!isPlayingMedia) {
+                    runOnUiThread {
                         txtDetail.text = "Heartbeat sin conexión"
                     }
                 }
             } catch (e: Exception) {
-                runOnUiThread {
-                    if (!isPlayingVideo) {
+                if (!isPlayingMedia) {
+                    runOnUiThread {
                         txtDetail.text = e.toString()
                     }
                 }
@@ -250,8 +261,8 @@ class MainActivity : AppCompatActivity() {
                     val body = response.body?.string().orEmpty()
 
                     if (!response.isSuccessful) {
-                        runOnUiThread {
-                            if (!isPlayingVideo) {
+                        if (!isPlayingMedia) {
+                            runOnUiThread {
                                 txtStatus.text = "Estado: error config"
                                 txtDetail.text = "HTTP ${response.code}: $body"
                             }
@@ -264,9 +275,10 @@ class MainActivity : AppCompatActivity() {
 
                     if (!paired) {
                         runOnUiThread {
-                            isPlayingVideo = false
+                            isPlayingMedia = false
                             infoPanel.visibility = View.VISIBLE
                             videoView.visibility = View.GONE
+                            imageView.visibility = View.GONE
                             txtStatus.text = "Estado: esperando vinculación"
                             txtCode.text = pairingCode
                             txtScreen.visibility = View.GONE
@@ -285,20 +297,9 @@ class MainActivity : AppCompatActivity() {
                         txtScreen.visibility = View.VISIBLE
                     }
 
-                    if (items.length() <= 0) return@use
+                    val newSignature = buildPlaylistSignature(items)
 
-                    val firstItem = items.getJSONObject(0)
-                    val relativeUrl = firstItem.optString("url", "")
-                    if (relativeUrl.isBlank()) return@use
-
-                    val fullUrl = if (relativeUrl.startsWith("http")) {
-                        relativeUrl
-                    } else {
-                        "$server$relativeUrl"
-                    }
-
-                    // Si ya está reproduciendo este mismo item, no hacer nada
-                    if (currentItemUrl == fullUrl && currentLocalPath.isNotBlank() && File(currentLocalPath).exists()) {
+                    if (newSignature == playlistSignature) {
                         return@use
                     }
 
@@ -306,23 +307,53 @@ class MainActivity : AppCompatActivity() {
                     isDownloading = true
 
                     try {
-                        val localFile = downloadFile(fullUrl)
-                        currentItemUrl = fullUrl
-                        currentLocalPath = localFile.absolutePath
-                        playLocalFile(localFile)
+                        val newList = mutableListOf<PlaylistItem>()
+
+                        for (i in 0 until items.length()) {
+                            val obj = items.getJSONObject(i)
+                            val id = obj.optInt("id", 0)
+                            val name = obj.optString("name", "")
+                            val relativeUrl = obj.optString("url", "")
+                            if (relativeUrl.isBlank()) continue
+
+                            val fullUrl = if (relativeUrl.startsWith("http")) {
+                                relativeUrl
+                            } else {
+                                "$server$relativeUrl"
+                            }
+
+                            val localFile = downloadFile(fullUrl)
+
+                            newList.add(
+                                PlaylistItem(
+                                    id = id,
+                                    name = name,
+                                    url = fullUrl,
+                                    localPath = localFile.absolutePath
+                                )
+                            )
+                        }
+
+                        playlistItems = newList
+                        playlistSignature = newSignature
+                        currentIndex = 0
+
+                        if (playlistItems.isNotEmpty()) {
+                            playItem(playlistItems[currentIndex])
+                        }
                     } finally {
                         isDownloading = false
                     }
                 }
             } catch (_: IOException) {
-                runOnUiThread {
-                    if (!isPlayingVideo) {
+                if (!isPlayingMedia) {
+                    runOnUiThread {
                         txtDetail.text = "Config sin conexión"
                     }
                 }
             } catch (e: Exception) {
-                runOnUiThread {
-                    if (!isPlayingVideo) {
+                if (!isPlayingMedia) {
+                    runOnUiThread {
                         txtDetail.text = e.toString()
                     }
                 }
@@ -330,11 +361,19 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
+    private fun buildPlaylistSignature(items: JSONArray): String {
+        val parts = mutableListOf<String>()
+        for (i in 0 until items.length()) {
+            val obj = items.getJSONObject(i)
+            parts.add("${obj.optInt("id", 0)}|${obj.optString("url", "")}")
+        }
+        return parts.joinToString("||")
+    }
+
     private fun downloadFile(url: String): File {
         val fileName = Uri.parse(url).lastPathSegment ?: "media.bin"
         val file = File(filesDir, fileName)
 
-        // Si ya existe, reutilizar
         if (file.exists() && file.length() > 0) {
             return file
         }
@@ -358,35 +397,83 @@ class MainActivity : AppCompatActivity() {
         return file
     }
 
-    private fun playLocalFile(file: File) {
+    private fun playItem(item: PlaylistItem) {
+        if (isImage(item.localPath)) {
+            playImage(item)
+        } else {
+            playVideo(item)
+        }
+    }
+
+    private fun playImage(item: PlaylistItem) {
         runOnUiThread {
             hideSystemUi()
+            isPlayingMedia = true
+            currentPlayingPath = item.localPath
 
+            videoView.stopPlayback()
+            videoView.visibility = View.GONE
+
+            val bitmap = BitmapFactory.decodeFile(item.localPath)
+            imageView.setImageBitmap(bitmap)
+            imageView.visibility = View.VISIBLE
             infoPanel.visibility = View.GONE
+
+            imageTimer?.cancel()
+            imageTimer = Timer()
+            imageTimer?.schedule(object : TimerTask() {
+                override fun run() {
+                    playNextItem()
+                }
+            }, 8000)
+        }
+    }
+
+    private fun playVideo(item: PlaylistItem) {
+        runOnUiThread {
+            hideSystemUi()
+            isPlayingMedia = true
+            currentPlayingPath = item.localPath
+
+            imageTimer?.cancel()
+            imageView.visibility = View.GONE
             videoView.visibility = View.VISIBLE
-            isPlayingVideo = true
+            infoPanel.visibility = View.GONE
 
-            // evita reabrir si ya está con ese mismo archivo
-            if (videoView.isPlaying && currentLocalPath == file.absolutePath) {
-                return@runOnUiThread
-            }
-
-            videoView.setVideoPath(file.absolutePath)
+            videoView.stopPlayback()
+            videoView.setVideoPath(item.localPath)
 
             videoView.setOnPreparedListener { mp ->
-                mp.isLooping = true
+                mp.isLooping = false
                 mp.seekTo(0)
                 videoView.start()
-                hideSystemUi()
+            }
+
+            videoView.setOnCompletionListener {
+                playNextItem()
             }
 
             videoView.setOnErrorListener { _, what, extra ->
-                isPlayingVideo = false
-                infoPanel.visibility = View.VISIBLE
-                videoView.visibility = View.GONE
-                txtDetail.text = "Video error what=$what extra=$extra"
+                playNextItem()
                 true
             }
         }
+    }
+
+    private fun playNextItem() {
+        if (playlistItems.isEmpty()) return
+
+        currentIndex++
+        if (currentIndex >= playlistItems.size) {
+            currentIndex = 0
+        }
+
+        val next = playlistItems[currentIndex]
+        playItem(next)
+    }
+
+    private fun isImage(path: String): Boolean {
+        val p = path.lowercase()
+        return p.endsWith(".png") || p.endsWith(".jpg") || p.endsWith(".jpeg") || p.endsWith(".webp")
     }
 }
