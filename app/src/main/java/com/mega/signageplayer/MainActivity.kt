@@ -4,8 +4,11 @@ import android.content.Context
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.util.DisplayMetrics
+import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -25,9 +28,14 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.util.Timer
 import java.util.TimerTask
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
 
+    private lateinit var rootLayout: FrameLayout
+    private lateinit var mediaContainer: FrameLayout
     private lateinit var videoView: VideoView
     private lateinit var imageView: ImageView
     private lateinit var infoPanel: LinearLayout
@@ -35,6 +43,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var txtCode: TextView
     private lateinit var txtScreen: TextView
     private lateinit var txtDetail: TextView
+    private lateinit var txtDebugViewport: TextView
 
     private val client = OkHttpClient()
     private val jsonType = "application/json; charset=utf-8".toMediaType()
@@ -56,7 +65,11 @@ class MainActivity : AppCompatActivity() {
 
     private var isPlayingMedia = false
     private var isDownloading = false
-    private var currentPlayingPath: String = ""
+
+    private var screenWidthPx: Int = 128
+    private var screenHeightPx: Int = 512
+    private var screenFit: String = "contain"
+    private var screenOrientation: String = "vertical"
 
     data class PlaylistItem(
         val id: Int,
@@ -74,6 +87,8 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         hideSystemUi()
 
+        rootLayout = findViewById(R.id.rootLayout)
+        mediaContainer = findViewById(R.id.mediaContainer)
         videoView = findViewById(R.id.videoView)
         imageView = findViewById(R.id.imageView)
         infoPanel = findViewById(R.id.infoPanel)
@@ -81,6 +96,7 @@ class MainActivity : AppCompatActivity() {
         txtCode = findViewById(R.id.txtCode)
         txtScreen = findViewById(R.id.txtScreen)
         txtDetail = findViewById(R.id.txtDetail)
+        txtDebugViewport = findViewById(R.id.txtDebugViewport)
 
         txtStatus.text = "Estado: iniciando..."
         txtCode.text = "------"
@@ -145,7 +161,7 @@ class MainActivity : AppCompatActivity() {
             override fun run() {
                 fetchConfig()
             }
-        }, 0, 6000)
+        }, 0, 4000)
     }
 
     private fun registerPlayer() {
@@ -277,8 +293,7 @@ class MainActivity : AppCompatActivity() {
                         runOnUiThread {
                             isPlayingMedia = false
                             infoPanel.visibility = View.VISIBLE
-                            videoView.visibility = View.GONE
-                            imageView.visibility = View.GONE
+                            mediaContainer.visibility = View.GONE
                             txtStatus.text = "Estado: esperando vinculación"
                             txtCode.text = pairingCode
                             txtScreen.visibility = View.GONE
@@ -288,6 +303,15 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     assignedScreen = data.optString("screen", "-")
+
+                    val screenCfg = data.optJSONObject("screen_cfg")
+                    if (screenCfg != null) {
+                        screenWidthPx = screenCfg.optInt("width_px", 128)
+                        screenHeightPx = screenCfg.optInt("height_px", 512)
+                        screenFit = screenCfg.optString("fit", "contain")
+                        screenOrientation = screenCfg.optString("orientation", "vertical")
+                    }
+
                     val items = data.optJSONArray("items") ?: JSONArray()
 
                     runOnUiThread {
@@ -295,6 +319,7 @@ class MainActivity : AppCompatActivity() {
                         txtCode.text = pairingCode
                         txtScreen.text = "Pantalla: $assignedScreen"
                         txtScreen.visibility = View.VISIBLE
+                        applyViewport()
                     }
 
                     val newSignature = buildPlaylistSignature(items)
@@ -361,6 +386,64 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
+    private fun waitForSync(startAt: Long) {
+
+        val now = System.currentTimeMillis()
+        val delay = startAt - now
+
+        if (delay <= 0) {
+            playNext()
+            return
+        }
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            playNext()
+        }, delay)
+
+    }
+
+    private fun applyViewport() {
+        val dm: DisplayMetrics = resources.displayMetrics
+        val screenW = dm.widthPixels
+        val screenH = dm.heightPixels
+
+        val srcW = max(1, screenWidthPx)
+        val srcH = max(1, screenHeightPx)
+
+        val scale = when (screenFit.lowercase()) {
+            "cover" -> max(screenW.toFloat() / srcW, screenH.toFloat() / srcH)
+            "stretch" -> -1f
+            else -> min(screenW.toFloat() / srcW, screenH.toFloat() / srcH)
+        }
+
+        val targetW: Int
+        val targetH: Int
+
+        if (scale < 0f) {
+            targetW = screenW
+            targetH = screenH
+        } else {
+            targetW = (srcW * scale).roundToInt()
+            targetH = (srcH * scale).roundToInt()
+        }
+
+        val params = mediaContainer.layoutParams as FrameLayout.LayoutParams
+        params.width = targetW
+        params.height = targetH
+        params.gravity = Gravity.TOP or Gravity.START
+        mediaContainer.layoutParams = params
+
+        runOnUiThread {
+            txtDebugViewport.text =
+                "BOX: ${screenW}x${screenH}\n" +
+                        "CMS SCREEN: $assignedScreen\n" +
+                        "CMS CFG: ${screenWidthPx}x${screenHeightPx}\n" +
+                        "FIT: $screenFit\n" +
+                        "ORIENTATION: $screenOrientation\n" +
+                        "VIEWPORT: ${targetW}x${targetH}"
+        }
+    }
+
     private fun buildPlaylistSignature(items: JSONArray): String {
         val parts = mutableListOf<String>()
         for (i in 0 until items.length()) {
@@ -409,7 +492,6 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             hideSystemUi()
             isPlayingMedia = true
-            currentPlayingPath = item.localPath
 
             videoView.stopPlayback()
             videoView.visibility = View.GONE
@@ -417,6 +499,8 @@ class MainActivity : AppCompatActivity() {
             val bitmap = BitmapFactory.decodeFile(item.localPath)
             imageView.setImageBitmap(bitmap)
             imageView.visibility = View.VISIBLE
+
+            mediaContainer.visibility = View.VISIBLE
             infoPanel.visibility = View.GONE
 
             imageTimer?.cancel()
@@ -433,11 +517,11 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             hideSystemUi()
             isPlayingMedia = true
-            currentPlayingPath = item.localPath
 
             imageTimer?.cancel()
             imageView.visibility = View.GONE
             videoView.visibility = View.VISIBLE
+            mediaContainer.visibility = View.VISIBLE
             infoPanel.visibility = View.GONE
 
             videoView.stopPlayback()
@@ -453,7 +537,7 @@ class MainActivity : AppCompatActivity() {
                 playNextItem()
             }
 
-            videoView.setOnErrorListener { _, what, extra ->
+            videoView.setOnErrorListener { _, _, _ ->
                 playNextItem()
                 true
             }
