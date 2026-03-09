@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:id="@+id/rootLayout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -12,11 +13,13 @@
         android:layout_gravity="top|start"
         android:background="#000000">
 
-        <VideoView
-            android:id="@+id/videoView"
+        <androidx.media3.ui.PlayerView
+            android:id="@+id/playerView"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:visibility="gone" />
+            android:visibility="gone"
+            app:show_buffering="always"
+            app:use_controller="false" />
 
         <ImageView
             android:id="@+id/imageView"
@@ -90,18 +93,5 @@
             android:text=""
             android:textColor="#FF8080"
             android:textSize="14sp" />
-
     </LinearLayout>
-
-    <TextView
-        android:id="@+id/txtDebugViewport"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="bottom|start"
-        android:background="#AA000000"
-        android:padding="10dp"
-        android:text="debug"
-        android:textColor="#00FF99"
-        android:textSize="14sp" />
-
 </FrameLayout>

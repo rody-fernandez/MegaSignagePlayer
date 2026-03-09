@@ -13,11 +13,16 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import android.widget.VideoView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -37,7 +42,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var rootLayout: FrameLayout
     private lateinit var mediaContainer: FrameLayout
-    private lateinit var videoView: VideoView
+    private lateinit var playerView: PlayerView
     private lateinit var imageView: ImageView
     private lateinit var infoPanel: LinearLayout
     private lateinit var txtStatus: TextView
@@ -48,7 +53,7 @@ class MainActivity : AppCompatActivity() {
     private val client = OkHttpClient()
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
-    // CAMBIA ESTA IP POR LA DE TU SERVIDOR CMS
+    // CAMBIÁ POR LA IP REAL DE TU SERVIDOR CMS
     private val server = "http://192.168.134.1:3000"
     private val playerName = "ANDROID-BOX"
 
@@ -78,6 +83,9 @@ class MainActivity : AppCompatActivity() {
     private var screenXOffset: Int = 0
     private var screenYOffset: Int = 0
 
+    private var exoPlayer: ExoPlayer? = null
+    private var pendingSyncStartAt: Long = 0L
+
     data class PlaylistItem(
         val id: Int,
         val name: String,
@@ -96,13 +104,15 @@ class MainActivity : AppCompatActivity() {
 
         rootLayout = findViewById(R.id.rootLayout)
         mediaContainer = findViewById(R.id.mediaContainer)
-        videoView = findViewById(R.id.videoView)
+        playerView = findViewById(R.id.playerView)
         imageView = findViewById(R.id.imageView)
         infoPanel = findViewById(R.id.infoPanel)
         txtStatus = findViewById(R.id.txtStatus)
         txtCode = findViewById(R.id.txtCode)
         txtScreen = findViewById(R.id.txtScreen)
         txtDetail = findViewById(R.id.txtDetail)
+
+        initPlayer()
 
         txtStatus.text = "Estado: iniciando..."
         txtCode.text = "------"
@@ -140,6 +150,35 @@ class MainActivity : AppCompatActivity() {
         configTimer?.cancel()
         imageTimer?.cancel()
         scheduledSyncRunnable?.let { mainHandler.removeCallbacks(it) }
+        releasePlayer()
+    }
+
+    private fun initPlayer() {
+        exoPlayer = ExoPlayer.Builder(this).build().also { player ->
+            playerView.player = player
+            playerView.useController = false
+
+            player.addListener(object : Player.Listener {
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    if (playbackState == Player.STATE_ENDED) {
+                        playNextItem()
+                    }
+                }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    runOnUiThread {
+                        txtDetail.text = "Exo error: ${error.message ?: error.toString()}"
+                    }
+                    playNextItem()
+                }
+            })
+        }
+    }
+
+    private fun releasePlayer() {
+        playerView.player = null
+        exoPlayer?.release()
+        exoPlayer = null
     }
 
     private fun hideSystemUi() {
@@ -152,7 +191,6 @@ class MainActivity : AppCompatActivity() {
     private fun startHeartbeat() {
         heartbeatTimer?.cancel()
         heartbeatTimer = Timer()
-
         heartbeatTimer?.scheduleAtFixedRate(object : TimerTask() {
             override fun run() {
                 sendHeartbeat()
@@ -163,12 +201,11 @@ class MainActivity : AppCompatActivity() {
     private fun startConfigPolling() {
         configTimer?.cancel()
         configTimer = Timer()
-
         configTimer?.scheduleAtFixedRate(object : TimerTask() {
             override fun run() {
                 fetchConfig()
             }
-        }, 0, 4000)
+        }, 0, 2000)
     }
 
     private fun registerPlayer() {
@@ -249,23 +286,13 @@ class MainActivity : AppCompatActivity() {
 
                 client.newCall(request).execute().use { response ->
                     if (!response.isSuccessful && !isPlayingMedia) {
-                        runOnUiThread {
-                            txtDetail.text = "Heartbeat HTTP ${response.code}"
-                        }
+                        runOnUiThread { txtDetail.text = "Heartbeat HTTP ${response.code}" }
                     }
                 }
             } catch (_: IOException) {
-                if (!isPlayingMedia) {
-                    runOnUiThread {
-                        txtDetail.text = "Heartbeat sin conexión"
-                    }
-                }
+                if (!isPlayingMedia) runOnUiThread { txtDetail.text = "Heartbeat sin conexión" }
             } catch (e: Exception) {
-                if (!isPlayingMedia) {
-                    runOnUiThread {
-                        txtDetail.text = e.toString()
-                    }
-                }
+                if (!isPlayingMedia) runOnUiThread { txtDetail.text = e.toString() }
             }
         }.start()
     }
@@ -346,12 +373,7 @@ class MainActivity : AppCompatActivity() {
                                     val relativeUrl = obj.optString("url", "")
                                     if (relativeUrl.isBlank()) continue
 
-                                    val fullUrl = if (relativeUrl.startsWith("http")) {
-                                        relativeUrl
-                                    } else {
-                                        "$server$relativeUrl"
-                                    }
-
+                                    val fullUrl = if (relativeUrl.startsWith("http")) relativeUrl else "$server$relativeUrl"
                                     val localFile = downloadFile(fullUrl)
 
                                     newList.add(
@@ -369,7 +391,7 @@ class MainActivity : AppCompatActivity() {
                                 currentIndex = 0
 
                                 if (playlistItems.isNotEmpty() && !isPlayingMedia) {
-                                    playItem(playlistItems[currentIndex])
+                                    prepareFirstItemPaused()
                                 }
                             } finally {
                                 isDownloading = false
@@ -377,7 +399,6 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
-                    // sincronización
                     val sync = data.optJSONObject("sync")
                     if (sync != null) {
                         val startAt = sync.optLong("startAt", 0L)
@@ -390,31 +411,36 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             } catch (_: IOException) {
-                if (!isPlayingMedia) {
-                    runOnUiThread {
-                        txtDetail.text = "Config sin conexión"
-                    }
-                }
+                if (!isPlayingMedia) runOnUiThread { txtDetail.text = "Config sin conexión" }
             } catch (e: Exception) {
-                if (!isPlayingMedia) {
-                    runOnUiThread {
-                        txtDetail.text = e.toString()
-                    }
-                }
+                if (!isPlayingMedia) runOnUiThread { txtDetail.text = e.toString() }
             }
         }.start()
     }
 
+    private fun prepareFirstItemPaused() {
+        if (playlistItems.isEmpty()) return
+        val item = playlistItems[0]
+        if (isImage(item.localPath)) return
+        prepareVideoPaused(item)
+    }
+
     private fun scheduleSyncStart(startAt: Long) {
         scheduledSyncRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingSyncStartAt = startAt
 
         val delay = startAt - System.currentTimeMillis()
 
         val runnable = Runnable {
             if (playlistItems.isEmpty()) return@Runnable
-
             currentIndex = 0
-            playItem(playlistItems[currentIndex])
+            val item = playlistItems[currentIndex]
+
+            if (isImage(item.localPath)) {
+                playImage(item)
+            } else {
+                startPreparedVideoOrPlay(item)
+            }
 
             runOnUiThread {
                 txtDetail.text = "SYNC OK @ $startAt"
@@ -513,8 +539,8 @@ class MainActivity : AppCompatActivity() {
             hideSystemUi()
             isPlayingMedia = true
 
-            videoView.stopPlayback()
-            videoView.visibility = View.GONE
+            exoPlayer?.pause()
+            playerView.visibility = View.GONE
 
             val bitmap = BitmapFactory.decodeFile(item.localPath)
             imageView.setImageBitmap(bitmap)
@@ -533,35 +559,50 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun playVideo(item: PlaylistItem) {
+    private fun prepareVideoPaused(item: PlaylistItem) {
+        runOnUiThread {
+            val player = exoPlayer ?: return@runOnUiThread
+            val mediaItem = MediaItem.fromUri(Uri.fromFile(File(item.localPath)))
+
+            player.setMediaItem(mediaItem)
+            player.prepare()
+            player.playWhenReady = false
+            player.pause()
+            player.seekTo(0)
+        }
+    }
+
+    private fun startPreparedVideoOrPlay(item: PlaylistItem) {
         runOnUiThread {
             hideSystemUi()
             isPlayingMedia = true
 
             imageTimer?.cancel()
             imageView.visibility = View.GONE
-            videoView.visibility = View.VISIBLE
+            playerView.visibility = View.VISIBLE
             mediaContainer.visibility = View.VISIBLE
             infoPanel.visibility = View.GONE
 
-            videoView.stopPlayback()
-            videoView.setVideoPath(item.localPath)
+            val player = exoPlayer ?: return@runOnUiThread
+            val currentUri = player.currentMediaItem?.localConfiguration?.uri
 
-            videoView.setOnPreparedListener { mp ->
-                mp.isLooping = false
-                mp.seekTo(0)
-                videoView.start()
-            }
-
-            videoView.setOnCompletionListener {
-                playNextItem()
-            }
-
-            videoView.setOnErrorListener { _, _, _ ->
-                playNextItem()
-                true
+            if (currentUri != null && currentUri == Uri.fromFile(File(item.localPath))) {
+                player.seekTo(0)
+                player.playWhenReady = true
+                player.play()
+            } else {
+                val mediaItem = MediaItem.fromUri(Uri.fromFile(File(item.localPath)))
+                player.setMediaItem(mediaItem)
+                player.prepare()
+                player.seekTo(0)
+                player.playWhenReady = true
+                player.play()
             }
         }
+    }
+
+    private fun playVideo(item: PlaylistItem) {
+        startPreparedVideoOrPlay(item)
     }
 
     private fun playNextItem() {
