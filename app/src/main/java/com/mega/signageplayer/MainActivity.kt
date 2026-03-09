@@ -4,7 +4,8 @@ import android.content.Context
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
-import android.util.DisplayMetrics
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -43,11 +44,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var txtCode: TextView
     private lateinit var txtScreen: TextView
     private lateinit var txtDetail: TextView
-    private lateinit var txtDebugViewport: TextView
 
     private val client = OkHttpClient()
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
+    // CAMBIA ESTA IP POR LA DE TU SERVIDOR CMS
     private val server = "http://192.168.134.1:3000"
     private val playerName = "ANDROID-BOX"
 
@@ -58,6 +59,10 @@ class MainActivity : AppCompatActivity() {
     private var heartbeatTimer: Timer? = null
     private var configTimer: Timer? = null
     private var imageTimer: Timer? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var scheduledSyncRunnable: Runnable? = null
+    private var lastSyncSeq = 0
 
     private var playlistSignature: String = ""
     private var playlistItems: MutableList<PlaylistItem> = mutableListOf()
@@ -70,6 +75,8 @@ class MainActivity : AppCompatActivity() {
     private var screenHeightPx: Int = 512
     private var screenFit: String = "contain"
     private var screenOrientation: String = "vertical"
+    private var screenXOffset: Int = 0
+    private var screenYOffset: Int = 0
 
     data class PlaylistItem(
         val id: Int,
@@ -96,7 +103,6 @@ class MainActivity : AppCompatActivity() {
         txtCode = findViewById(R.id.txtCode)
         txtScreen = findViewById(R.id.txtScreen)
         txtDetail = findViewById(R.id.txtDetail)
-        txtDebugViewport = findViewById(R.id.txtDebugViewport)
 
         txtStatus.text = "Estado: iniciando..."
         txtCode.text = "------"
@@ -133,6 +139,7 @@ class MainActivity : AppCompatActivity() {
         heartbeatTimer?.cancel()
         configTimer?.cancel()
         imageTimer?.cancel()
+        scheduledSyncRunnable?.let { mainHandler.removeCallbacks(it) }
     }
 
     private fun hideSystemUi() {
@@ -310,6 +317,8 @@ class MainActivity : AppCompatActivity() {
                         screenHeightPx = screenCfg.optInt("height_px", 512)
                         screenFit = screenCfg.optString("fit", "contain")
                         screenOrientation = screenCfg.optString("orientation", "vertical")
+                        screenXOffset = screenCfg.optInt("x_offset", 0)
+                        screenYOffset = screenCfg.optInt("y_offset", 0)
                     }
 
                     val items = data.optJSONArray("items") ?: JSONArray()
@@ -324,50 +333,60 @@ class MainActivity : AppCompatActivity() {
 
                     val newSignature = buildPlaylistSignature(items)
 
-                    if (newSignature == playlistSignature) {
-                        return@use
+                    if (newSignature != playlistSignature) {
+                        if (!isDownloading) {
+                            isDownloading = true
+                            try {
+                                val newList = mutableListOf<PlaylistItem>()
+
+                                for (i in 0 until items.length()) {
+                                    val obj = items.getJSONObject(i)
+                                    val id = obj.optInt("id", 0)
+                                    val name = obj.optString("name", "")
+                                    val relativeUrl = obj.optString("url", "")
+                                    if (relativeUrl.isBlank()) continue
+
+                                    val fullUrl = if (relativeUrl.startsWith("http")) {
+                                        relativeUrl
+                                    } else {
+                                        "$server$relativeUrl"
+                                    }
+
+                                    val localFile = downloadFile(fullUrl)
+
+                                    newList.add(
+                                        PlaylistItem(
+                                            id = id,
+                                            name = name,
+                                            url = fullUrl,
+                                            localPath = localFile.absolutePath
+                                        )
+                                    )
+                                }
+
+                                playlistItems = newList
+                                playlistSignature = newSignature
+                                currentIndex = 0
+
+                                if (playlistItems.isNotEmpty() && !isPlayingMedia) {
+                                    playItem(playlistItems[currentIndex])
+                                }
+                            } finally {
+                                isDownloading = false
+                            }
+                        }
                     }
 
-                    if (isDownloading) return@use
-                    isDownloading = true
+                    // sincronización
+                    val sync = data.optJSONObject("sync")
+                    if (sync != null) {
+                        val startAt = sync.optLong("startAt", 0L)
+                        val seq = sync.optInt("seq", 0)
 
-                    try {
-                        val newList = mutableListOf<PlaylistItem>()
-
-                        for (i in 0 until items.length()) {
-                            val obj = items.getJSONObject(i)
-                            val id = obj.optInt("id", 0)
-                            val name = obj.optString("name", "")
-                            val relativeUrl = obj.optString("url", "")
-                            if (relativeUrl.isBlank()) continue
-
-                            val fullUrl = if (relativeUrl.startsWith("http")) {
-                                relativeUrl
-                            } else {
-                                "$server$relativeUrl"
-                            }
-
-                            val localFile = downloadFile(fullUrl)
-
-                            newList.add(
-                                PlaylistItem(
-                                    id = id,
-                                    name = name,
-                                    url = fullUrl,
-                                    localPath = localFile.absolutePath
-                                )
-                            )
+                        if (seq > lastSyncSeq && startAt > 0) {
+                            lastSyncSeq = seq
+                            scheduleSyncStart(startAt)
                         }
-
-                        playlistItems = newList
-                        playlistSignature = newSignature
-                        currentIndex = 0
-
-                        if (playlistItems.isNotEmpty()) {
-                            playItem(playlistItems[currentIndex])
-                        }
-                    } finally {
-                        isDownloading = false
                     }
                 }
             } catch (_: IOException) {
@@ -386,26 +405,37 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun waitForSync(startAt: Long) {
+    private fun scheduleSyncStart(startAt: Long) {
+        scheduledSyncRunnable?.let { mainHandler.removeCallbacks(it) }
 
-        val now = System.currentTimeMillis()
-        val delay = startAt - now
+        val delay = startAt - System.currentTimeMillis()
 
-        if (delay <= 0) {
-            playNext()
-            return
+        val runnable = Runnable {
+            if (playlistItems.isEmpty()) return@Runnable
+
+            currentIndex = 0
+            playItem(playlistItems[currentIndex])
+
+            runOnUiThread {
+                txtDetail.text = "SYNC OK @ $startAt"
+            }
         }
 
-        Handler(Looper.getMainLooper()).postDelayed({
-            playNext()
-        }, delay)
+        scheduledSyncRunnable = runnable
 
+        if (delay <= 0) {
+            mainHandler.post(runnable)
+        } else {
+            mainHandler.postDelayed(runnable, delay)
+            runOnUiThread {
+                txtDetail.text = "SYNC esperando ${delay}ms"
+            }
+        }
     }
 
     private fun applyViewport() {
-        val dm: DisplayMetrics = resources.displayMetrics
-        val screenW = dm.widthPixels
-        val screenH = dm.heightPixels
+        val screenW = resources.displayMetrics.widthPixels
+        val screenH = resources.displayMetrics.heightPixels
 
         val srcW = max(1, screenWidthPx)
         val srcH = max(1, screenHeightPx)
@@ -432,16 +462,6 @@ class MainActivity : AppCompatActivity() {
         params.height = targetH
         params.gravity = Gravity.TOP or Gravity.START
         mediaContainer.layoutParams = params
-
-        runOnUiThread {
-            txtDebugViewport.text =
-                "BOX: ${screenW}x${screenH}\n" +
-                        "CMS SCREEN: $assignedScreen\n" +
-                        "CMS CFG: ${screenWidthPx}x${screenHeightPx}\n" +
-                        "FIT: $screenFit\n" +
-                        "ORIENTATION: $screenOrientation\n" +
-                        "VIEWPORT: ${targetW}x${targetH}"
-        }
     }
 
     private fun buildPlaylistSignature(items: JSONArray): String {
