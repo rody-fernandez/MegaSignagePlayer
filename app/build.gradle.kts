@@ -4,22 +4,22 @@ plugins {
 }
 
 android {
-    namespace = "com.example.megasignageplayer"
-    compileSdk = 35
+    namespace = "com.mega.signageplayer"
+    compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.megasignageplayer"
+        applicationId = "com.mega.signageplayer"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 34
         versionCode = 1
         versionName = "1.0"
     }
 
     buildTypes {
-        debug {
+        release {
             isMinifyEnabled = false
         }
-        release {
+        debug {
             isMinifyEnabled = false
         }
     }
@@ -35,9 +35,12 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("androidx.media3:media3-exoplayer:1.9.2")
-    implementation("androidx.media3:media3-ui:1.9.2")
+    implementation("com.google.android.material:material:1.12.0")
+
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation("androidx.media3:media3-ui:1.4.1")
+
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

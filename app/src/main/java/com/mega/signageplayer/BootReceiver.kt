@@ -1,4 +1,4 @@
-package com.example.megasignageplayer
+package com.mega.signageplayer
 
 import android.content.BroadcastReceiver
 import android.content.Context
